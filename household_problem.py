@@ -3,81 +3,58 @@
 import numpy as np
 import numba as nb
 
-from consav.linear_interp import interp_1d_vec
+from consav.linear_interp import interp_1d
 
-@nb.njit        
-def solve_hh_backwards(par,z_trans,w,r,d,tau,vbeg_a_plus,vbeg_a,a,c,ell,n,ss=False):
-    """ solve backwards with vbeg_a_plus from previous iteration """
+@nb.njit(parallel=True)
+def solve_hh_backwards(par,z_trans,Z,ra,rl,vbeg_l_plus,vbeg_l,l,c,a,uce):
+    """ solve backwards with vbeg_l from previous iteration """
 
-    for i_fix in range(par.Nfix):
-        
-        # a. solution step
-        for i_z in range(par.Nz):
+    # unpack
+    A_target = par.A_target
+    ra_ss = par.r_ss_target
 
-            # i. prepare
-            z = par.z_grid[i_z]
-            T = d*z - tau*z
-            fac = (w*z/par.varphi)**(1/par.nu)
+    # solve
+    for i_fix in nb.prange(par.Nfix):
+        for i_z in nb.prange(par.Nz):
 
-            if ss:
+            e = par.z_grid[i_z]  # productivity
+            Ze = Z*e # labor income
 
-                ell[i_fix,i_z,:] = 1.0
-                n[i_fix,i_z,:] = ell[i_fix,i_z,:]*z
-                a[i_fix,i_z,:] = 0.0
-                c[i_fix,i_z,:] = (1+r)*par.a_grid + w*n[i_fix,i_z,:] + T
-                
-                continue
+            for i_a_lag in range(par.Na): # end-of-previous-period
 
-            # ii. use focs
-            c_endo = (par.beta*vbeg_a_plus[i_fix,i_z,:])**(-1/par.sigma)
-            ell_endo = fac*(par.beta*vbeg_a_plus[i_fix,i_z,:])**(1/par.nu)
-            n_endo = ell_endo*z
+                c_endo = (par.beta_grid[i_fix]*vbeg_l_plus[i_fix,i_z,:,i_a_lag])**(-1 / par.sigma)
+                m_endo = c_endo + par.l_grid
 
-            # iii. re-interpolate
-            a_lag_endo = (c_endo + par.a_grid - w*n_endo - T)/(1+r)
-            a_lag = par.a_grid
+                for i_l_lag in range(par.Nl): # end-of-period
 
-            interp_1d_vec(a_lag_endo,c_endo,a_lag,c[i_fix,i_z,:])
-            interp_1d_vec(a_lag_endo,ell_endo,a_lag,ell[i_fix,i_z,:])
+                    a_lag = par.a_grid[i_a_lag]
 
-            n[i_fix,i_z,:] = ell[i_fix,i_z,:]*z
+                    # interpolation to fixed grid
+                    d = ra_ss/(1+ra_ss)*(1+ra)*a_lag + par.chi*((1+ra)*a_lag-(1+ra_ss)*A_target)
+                    m = (1+rl) * par.l_grid[i_l_lag] + Ze + d
 
-            # iv. saving
-            a[i_fix,i_z,:] = (1+r)*a_lag + w*n[i_fix,i_z,:] + T - c[i_fix,i_z,:]
+                    # liquid assets
+                    l[i_fix,i_z,i_l_lag,i_a_lag] = interp_1d(m_endo,par.l_grid,m)
+                    l[i_fix,i_z,i_l_lag,i_a_lag] = np.fmax(l[i_fix,i_z,i_l_lag,i_a_lag],0.0)  # enforce borrowing constraint
 
-            # v. refinement at constraint
-            for i_a in range(par.Na):
+                    # consumption
+                    c[i_fix,i_z,i_l_lag,i_a_lag] = m-l[i_fix,i_z,i_l_lag,i_a_lag]
+                    c[i_fix,i_z,i_l_lag,i_a_lag] = np.fmax(c[i_fix,i_z,i_l_lag,i_a_lag],0.0) # enforce non-negative consumption
 
-                if a[i_fix,i_z,i_a] < par.a_min:
-                    
-                    # i. binding constraint for a
-                    a[i_fix,i_z,i_a] = par.a_min
+                    # illiquid assets
+                    a[i_fix,i_z,i_l_lag,i_a_lag] = (1+ra)*a_lag-d
 
-                    # ii. solve foc for n
-                    elli = ell[i_fix,i_z,i_a]
-                    for i in range(30):
-
-                        ci = (1+r)*par.a_grid[i_a] + w*z*elli + T - par.a_min # from binding constraint
-
-                        error = elli - fac*ci**(-par.sigma/par.nu)
-                        if np.abs(error) < 1e-11:
-                            break
-                        else:
-                            derror = 1 - fac*(-par.sigma/par.nu)*ci**(-par.sigma/par.nu-1)*w*z
-                            elli = elli - error/derror
-                    else:
-                        
-                        raise ValueError('solution could not be found')
-
-                    # iii. save
-                    c[i_fix,i_z,i_a] = ci
-                    ell[i_fix,i_z,i_a] = elli
-                    n[i_fix,i_z,i_a] = elli*z
-                    
-                else:
-
-                    break
+                    # productivity weighted marg. util.
+                    uce[i_fix,i_z,i_l_lag,i_a_lag] = e*c[i_fix,i_z,i_l_lag,i_a_lag]**(-par.sigma)
 
         # b. expectation step
-        v_a = c[i_fix,:,:]**(-par.sigma)
-        vbeg_a[i_fix] = (1+r)*z_trans[i_fix]@v_a
+        v_l_a = (1+rl)*c[i_fix]**(-par.sigma)
+
+        for i_z_lag in nb.prange(par.Nz):
+            for i_l_lag in nb.prange(par.Nl):
+                for i_a_lag in nb.prange(par.Na):
+
+                    vbeg_l[i_fix,i_z_lag,i_l_lag,i_a_lag] = 0.0
+
+                    for i_z in range(par.Nz): # after realization
+                        vbeg_l[i_fix,i_z_lag,i_l_lag,i_a_lag] += z_trans[i_fix,i_z_lag,i_z]*v_l_a[i_z,i_l_lag,i_a_lag]
